@@ -1,4 +1,7 @@
 name: Test
+permissions:
+  contents: read
+  pull-requests: write
 "on":
   workflow_dispatch:
   push:
@@ -22,6 +25,8 @@ jobs:
           - 22
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
       - name: Test with Node.js ${{ matrix.node_version }}
         uses: actions/setup-node@v6
         with:
@@ -35,6 +40,48 @@ jobs:
       - run: npm run start-fixtures-server &
       - run: sleep 3
       - run: npm run test --ignore-scripts
+
+      - name: Export Jibril profile
+        if: always()
+        run: |
+          set -uo pipefail
+          sudo systemctl stop jibril.service || true
+          for i in $(seq 1 10); do
+            if sudo test -f /var/log/jibril.profile.json; then break; fi
+            sleep 1
+          done
+          mkdir -p "$RUNNER_TEMP/gcg"
+          if sudo test -f /var/log/jibril.profile.json; then
+            sudo cp /var/log/jibril.profile.json "$RUNNER_TEMP/gcg/profile.json"
+            sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/gcg/profile.json"
+          fi
+      - name: Render and upsert Garnet coverage-gap comment
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PROFILE_PATH: ${{ runner.temp }}/gcg/profile.json
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO_LABEL: rest.js
+          COVGAP_MARKER: garnet-covgap-rest.js
+        run: |
+          set -euo pipefail
+          base_ref="${{ github.event.pull_request.base.ref }}"
+          git fetch origin "$base_ref" >/dev/null 2>&1 || true
+          export DIFF_NUMSTAT=$(git diff --numstat "origin/${base_ref}...${HEAD_SHA}" || true)
+          git diff "origin/${base_ref}...${HEAD_SHA}" > "$RUNNER_TEMP/diff.patch" || true
+          export DIFF_PATCH_PATH="$RUNNER_TEMP/diff.patch"
+          [ -f package-lock.json ] && export LOCKFILE_PATH="$PWD/package-lock.json"
+          node .github/scripts/coverage-gap.mjs > "$RUNNER_TEMP/covgap.md" 2>/dev/null || { echo "covgap render failed"; exit 0; }
+          cat "$RUNNER_TEMP/covgap.md" >> "$GITHUB_STEP_SUMMARY"
+          marker="garnet-covgap-rest.js"
+          existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq "[.[] | select(.body | contains(\"${marker}\")) | .id] | first // empty")
+          if [ -n "$existing" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -X PATCH -F body=@"$RUNNER_TEMP/covgap.md" >/dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -X POST -F body=@"$RUNNER_TEMP/covgap.md" >/dev/null
+          fi
   test:
     runs-on: ubuntu-latest
     needs: test_matrix
